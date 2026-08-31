@@ -1,0 +1,7 @@
+Autonomous CSI Collector
+
+Tracked-source review found no vendored third-party source code or binary
+assets. The runtime dependency declared in
+software/autonomous-csi-collector/pyproject.toml is resolved separately and is
+not distributed by this repository. No third-party attribution notice is
+therefore reproduced here.

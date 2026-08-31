@@ -1,0 +1,17 @@
+schema_version = 1
+
+# This is a path policy, not a content-classification claim.
+[tracked_path_policy]
+# These are authoritative workspace-owned private/generated surfaces and cannot
+# be tracked in this public repository.
+forbidden_directory_prefixes = [
+  "materials/",
+  "provenance/",
+  "experiments/",
+  "locations/",
+  "private/",
+]
+forbidden_exact_paths = [
+  "mean/experiments.generated.toml",
+  "evidence/publications.generated.toml",
+]

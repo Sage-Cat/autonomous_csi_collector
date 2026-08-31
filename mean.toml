@@ -1,0 +1,18 @@
+schema_version = 1
+mean_id = "autonomous_csi_collector"
+canonical_name = "Autonomous CSI Collector"
+implementation_surface = "software/autonomous-csi-collector"
+
+[practical_contract]
+implementation_kind = "software"
+practical_task = "Acquire configured serial CSI/telemetry streams unattended and mediate correlated firmware measurement-rate transactions on a local host."
+usable_result = "A sealed operator-owned run directory with lossless source records, checksums, neutral evidence facts, and hash-chained command transaction evidence."
+intended_user = "Authorized collector operator."
+application_route = "Install the collector, provide a validated local configuration, and select an operator-owned run destination outside this repository."
+inputs = ["Configured serial sources", "Writable run storage outside this repository"]
+outputs = ["Versioned timestamped source records", "Operational metadata and checksums", "Neutral evidence facts", "Verified command transaction ledger"]
+exclusions = ["CSI interpretation, controller policy, firmware ownership, and scientific claims"]
+verification_routes = [
+  "cd software/autonomous-csi-collector && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v",
+  "PYTHONDONTWRITEBYTECODE=1 python3 scripts/validate_repository.py",
+]

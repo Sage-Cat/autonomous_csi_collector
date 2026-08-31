@@ -1,0 +1,22 @@
+[Unit]
+Description=CWS autonomous CSI collector
+After=local-fs.target
+RequiresMountsFor=/var/lib/cws-collector
+
+[Service]
+Type=simple
+User=cws-collector
+Group=cws-collector
+SupplementaryGroups=dialout
+UMask=0027
+ExecStart=/opt/cws-collector/venv/bin/cws-collector --state-dir /var/lib/cws-collector service
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cws-collector
+
+[Install]
+WantedBy=multi-user.target

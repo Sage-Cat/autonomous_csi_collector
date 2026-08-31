@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "site_id": "REPLACE_SITE_ID",
+  "collection_mode": "unlabeled-operational",
+  "network_policy": "observe-only",
+  "chunk_seconds": 300,
+  "sync_seconds": 5,
+  "status_seconds": 5,
+  "health_seconds": 10,
+  "minimum_free_bytes": 8589934592,
+  "sources": [{"source_id": "serial-source", "device": "/dev/serial/by-id/REPLACE_SERIAL_DEVICE", "baud": 921600, "reconnect_seconds": 2, "expected_compressed_bytes_per_second": 50000, "enabled": true}],
+  "samplers": []
+}

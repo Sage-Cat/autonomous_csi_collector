@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "site_id": "REPLACE_SITE_ID",
+  "collection_mode": "unlabeled-operational",
+  "network_policy": "observe-only",
+  "chunk_seconds": 300,
+  "sync_seconds": 5,
+  "status_seconds": 5,
+  "health_seconds": 10,
+  "minimum_free_bytes": 8589934592,
+  "sources": [
+    {"source_id": "serial-source-1", "device": "/dev/serial/by-id/REPLACE_SERIAL_SOURCE_1", "baud": 921600, "reconnect_seconds": 2, "expected_compressed_bytes_per_second": 50000, "enabled": true},
+    {"source_id": "serial-source-2", "device": "/dev/serial/by-id/REPLACE_SERIAL_SOURCE_2", "baud": 921600, "reconnect_seconds": 2, "expected_compressed_bytes_per_second": 50000, "enabled": true},
+    {"source_id": "serial-source-3", "device": "/dev/serial/by-id/REPLACE_SERIAL_SOURCE_3", "baud": 921600, "reconnect_seconds": 2, "expected_compressed_bytes_per_second": 50000, "enabled": true},
+    {"source_id": "serial-source-4", "device": "/dev/serial/by-id/REPLACE_SERIAL_SOURCE_4", "baud": 921600, "reconnect_seconds": 2, "expected_compressed_bytes_per_second": 50000, "enabled": false}
+  ],
+  "samplers": [
+    {"sampler_id": "telemetry", "argv": ["/usr/local/libexec/cws/read-telemetry"], "interval_seconds": 2, "timeout_seconds": 1, "max_output_bytes": 4194304, "enabled": false},
+    {"sampler_id": "rf-survey", "argv": ["/usr/local/libexec/cws/read-rf-survey"], "interval_seconds": 300, "timeout_seconds": 30, "max_output_bytes": 4194304, "enabled": false},
+    {"sampler_id": "qos", "argv": ["/usr/local/libexec/cws/read-qos"], "interval_seconds": 2, "timeout_seconds": 1, "max_output_bytes": 4194304, "enabled": false}
+  ]
+}
