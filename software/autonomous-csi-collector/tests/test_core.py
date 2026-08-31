@@ -4,20 +4,27 @@ import gzip
 import json
 import os
 import pty
+import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import cws_collector.core as core_module
 from cws_collector.core import (
     ChunkWriter,
     CollectorError,
+    EventLog,
+    SerialWorker,
     SourceStats,
     arm_run,
     parse_duration,
     request_rate,
     request_reboot,
+    request_stop,
     wait_rate_result,
     service_loop,
     validate_config,
@@ -181,6 +188,222 @@ class ChunkTests(unittest.TestCase):
             self.assertFalse(verify_run(run_dir)["ok"])
 
 
+class BlockingSerialPort:
+    def __init__(self, blocked_operation: str):
+        self.blocked_operation = blocked_operation
+        self.read_entered = threading.Event()
+        self.write_entered = threading.Event()
+        self.read_released = threading.Event()
+        self.write_released = threading.Event()
+        self.closed = False
+        self.flush_called = False
+
+    def __enter__(self) -> BlockingSerialPort:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def read_until(self, *, expected: bytes, size: int) -> bytes:
+        self.assert_bounded_read(expected, size)
+        self.read_entered.set()
+        if self.blocked_operation == "read":
+            self.read_released.wait(5)
+        return b""
+
+    @staticmethod
+    def assert_bounded_read(expected: bytes, size: int) -> None:
+        if expected != b"\n" or size <= 0:
+            raise AssertionError("serial read must have a delimiter and a size bound")
+
+    def write(self, payload: bytes) -> int:
+        self.write_entered.set()
+        if self.blocked_operation == "write":
+            self.write_released.wait(5)
+            return 0
+        return len(payload)
+
+    def flush(self) -> None:
+        self.flush_called = True
+        raise AssertionError("serial flush/tcdrain must not be used")
+
+    def cancel_read(self) -> None:
+        self.read_released.set()
+
+    def cancel_write(self) -> None:
+        self.write_released.set()
+
+    def close(self) -> None:
+        self.closed = True
+        self.read_released.set()
+        self.write_released.set()
+
+
+class SerialShutdownTests(unittest.TestCase):
+    def make_worker(
+        self,
+        state_dir: Path,
+        port: BlockingSerialPort,
+        *,
+        queued_reboot: bool = False,
+    ) -> tuple[SerialWorker, threading.Event, SourceStats, dict[str, object]]:
+        run_dir = state_dir / "runs/run-test"
+        run_dir.mkdir(parents=True)
+        source = {
+            "source_id": "esp32-test",
+            "device": "/dev/fake",
+            "baud": 115200,
+            "reconnect_seconds": 0.01,
+        }
+        if queued_reboot:
+            command_dir = state_dir / "control"
+            command_dir.mkdir()
+            (command_dir / "esp32-test.json").write_text(
+                json.dumps(
+                    {
+                        "command_id": "command-test",
+                        "kind": "reboot",
+                        "run_id": "run-test",
+                        "source_id": "esp32-test",
+                    }
+                ),
+                encoding="utf-8",
+            )
+        stop_event = threading.Event()
+        stats = SourceStats("esp32-test")
+        worker = SerialWorker(
+            source,
+            run_dir,
+            "session-test",
+            stop_event,
+            stats,
+            EventLog(run_dir / "events.ndjson", "session-test"),
+            10,
+            1,
+            threading.Lock(),
+            state_dir,
+        )
+        serial_call: dict[str, object] = {}
+
+        class FakeSerialException(Exception):
+            pass
+
+        def open_port(**kwargs: object) -> BlockingSerialPort:
+            serial_call.update(kwargs)
+            return port
+
+        worker.fake_serial_module = types.SimpleNamespace(  # type: ignore[attr-defined]
+            Serial=open_port,
+            SerialException=FakeSerialException,
+        )
+        return worker, stop_event, stats, serial_call
+
+    def run_with_fake_serial(self, worker: SerialWorker) -> patch:
+        fake_serial_module = worker.fake_serial_module  # type: ignore[attr-defined]
+        serial_patch = patch.dict(sys.modules, {"serial": fake_serial_module})
+        serial_patch.start()
+        self.addCleanup(serial_patch.stop)
+        worker.start()
+        return serial_patch
+
+    def test_blocked_read_is_cancelled_and_port_released_without_disconnect(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            port = BlockingSerialPort("read")
+            worker, stop_event, stats, serial_call = self.make_worker(Path(temporary), port)
+            self.run_with_fake_serial(worker)
+            self.assertTrue(port.read_entered.wait(1), "worker never entered its serial read")
+
+            stop_event.set()
+            worker.interrupt_io()
+            worker.join(2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(port.closed)
+            self.assertEqual(serial_call["timeout"], 1.0)
+            self.assertEqual(serial_call["write_timeout"], 1.0)
+            self.assertEqual(stats.snapshot(time.monotonic_ns())["errors"], 0)
+            events = (Path(temporary) / "runs/run-test/events.ndjson").read_text(encoding="utf-8")
+            self.assertNotIn('"event_type":"source_disconnected"', events)
+
+    def test_blocked_short_write_is_cancelled_without_flush_or_disconnect(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            port = BlockingSerialPort("write")
+            worker, stop_event, stats, _serial_call = self.make_worker(
+                state_dir,
+                port,
+                queued_reboot=True,
+            )
+            self.run_with_fake_serial(worker)
+            self.assertTrue(port.write_entered.wait(1), "worker never entered its serial write")
+
+            stop_event.set()
+            worker.interrupt_io()
+            worker.join(2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(port.closed)
+            self.assertFalse(port.flush_called)
+            self.assertTrue((state_dir / "control/esp32-test.json").exists())
+            self.assertEqual(stats.snapshot(time.monotonic_ns())["errors"], 0)
+            events = (state_dir / "runs/run-test/events.ndjson").read_text(encoding="utf-8")
+            self.assertNotIn('"event_type":"source_disconnected"', events)
+
+    def test_stubborn_worker_prevents_finalization_and_retains_active_run(self) -> None:
+        class StubbornSerialWorker:
+            instances: list[StubbornSerialWorker] = []
+
+            def __init__(self, source: dict[str, object], *_args: object, **_kwargs: object):
+                self.name = f"serial-{source['source_id']}"
+                self.interrupts: list[bool] = []
+                self.instances.append(self)
+
+            def start(self) -> None:
+                pass
+
+            def join(self, timeout: float | None = None) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return True
+
+            def interrupt_io(self, *, force_close: bool = False) -> None:
+                self.interrupts.append(force_close)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            run_dir = state_dir / "runs/run-test"
+            run_dir.mkdir(parents=True)
+            active = {
+                "run_id": "run-test",
+                "run_dir": str(run_dir),
+                "deadline_wall_time": "2099-01-01T00:00:00Z",
+                "deadline_wall_time_ns": time.time_ns() + 60_000_000_000,
+                "stop_requested": True,
+                "config": {
+                    "schema_version": 1,
+                    "minimum_free_bytes": 1024**3,
+                    "sources": [{"source_id": "esp32-test", "device": "/dev/fake"}],
+                },
+            }
+            (state_dir / "active.json").write_text(json.dumps(active), encoding="utf-8")
+
+            with patch.object(core_module, "SerialWorker", StubbornSerialWorker):
+                with self.assertRaisesRegex(CollectorError, "workers did not stop"):
+                    service_loop(state_dir, once=True)
+
+            self.assertTrue((state_dir / "active.json").exists())
+            self.assertFalse((state_dir / "last-run.json").exists())
+            for name in ("final.json", "evidence-facts.json", "SHA256SUMS"):
+                self.assertFalse((run_dir / name).exists(), name)
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.ndjson").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertIn("worker_shutdown_timeout", [event["event_type"] for event in events])
+            self.assertEqual(StubbornSerialWorker.instances[0].interrupts, [False, True])
+
+
 class ServiceIntegrationTests(unittest.TestCase):
     def test_arm_collect_finalize_and_verify(self) -> None:
         try:
@@ -303,6 +526,76 @@ class ServiceIntegrationTests(unittest.TestCase):
             self.assertEqual(sampler_records[0]["returncode"], 0)
             self.assertFalse((state_dir / "active.json").exists())
             self.assertTrue(verify_run(run_dir)["ok"])
+
+    def test_operator_stop_interrupts_pty_read_and_releases_device(self) -> None:
+        try:
+            import serial
+        except ModuleNotFoundError:
+            self.skipTest("pyserial is not installed")
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            master, slave = pty.openpty()
+            slave_name = os.ttyname(slave)
+            os.close(slave)
+            self.addCleanup(os.close, master)
+            config = {
+                "schema_version": 1,
+                "chunk_seconds": 10,
+                "sync_seconds": 1,
+                "status_seconds": 1,
+                "health_seconds": 1,
+                "minimum_free_bytes": 1024**3,
+                "sources": [
+                    {
+                        "source_id": "esp32-test",
+                        "device": slave_name,
+                        "baud": 115200,
+                        "expected_compressed_bytes_per_second": 100,
+                    }
+                ],
+            }
+            config_path = state_dir / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            active = arm_run(config_path, state_dir, 30, "pty-stop")
+            service_errors: list[BaseException] = []
+
+            def serve() -> None:
+                try:
+                    service_loop(state_dir, once=True)
+                except BaseException as exc:
+                    service_errors.append(exc)
+
+            service = threading.Thread(target=serve)
+            service.start()
+            events_path = Path(active["run_dir"]) / "events.ndjson"
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if events_path.exists() and "source_connected" in events_path.read_text(encoding="utf-8"):
+                    break
+                time.sleep(0.01)
+            else:
+                request_stop(state_dir, "test cleanup")
+                service.join(3)
+                self.fail(f"serial worker did not connect: {service_errors!r}")
+
+            request_stop(state_dir, "deterministic PTY shutdown test")
+            service.join(3)
+
+            self.assertFalse(service.is_alive())
+            self.assertEqual(service_errors, [])
+            self.assertFalse((state_dir / "active.json").exists())
+            events = events_path.read_text(encoding="utf-8")
+            self.assertNotIn("worker_shutdown_timeout", events)
+            self.assertNotIn("source_disconnected", events)
+            self.assertTrue(verify_run(Path(active["run_dir"]))["ok"])
+            with serial.Serial(
+                port=slave_name,
+                baudrate=115200,
+                timeout=0.1,
+                write_timeout=0.1,
+                exclusive=True,
+            ):
+                pass
 
 
 if __name__ == "__main__":

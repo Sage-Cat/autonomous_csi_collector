@@ -647,8 +647,10 @@ class FirmwareControlBridge:
             "phase_key": phase_key,
         }
         self._save()
-        port.write(line.encode("ascii"))
-        port.flush()
+        payload = line.encode("ascii")
+        written = port.write(payload)
+        if written != len(payload):
+            raise OSError(f"short serial control write: {written}/{len(payload)} bytes")
         self._event(
             "sent",
             phase=phase,

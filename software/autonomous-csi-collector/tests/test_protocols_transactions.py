@@ -50,7 +50,7 @@ class FakePort:
         return len(payload)
 
     def flush(self) -> None:
-        pass
+        raise AssertionError("serial flush/tcdrain must not be used")
 
 
 def request_fields(line: str) -> dict[str, str]:
@@ -208,6 +208,15 @@ class TransactionBridgeTests(unittest.TestCase):
         self.assertEqual(request_fields(line)["operation"], "APPLY")
         self.bridge.handle_line(reply_for(line, status="applied", reason="applied", config=5, hz=20))
         return line
+
+    def test_short_serial_write_is_rejected_without_flush(self) -> None:
+        class ShortWritePort(FakePort):
+            def write(self, payload: bytes) -> int:
+                self.lines.append(payload.decode("ascii"))
+                return len(payload) - 1
+
+        with self.assertRaisesRegex(OSError, "short serial control write"):
+            self.bridge.poll(ShortWritePort())
 
     def test_verified_commit_requires_correlated_get_state(self) -> None:
         self.send_initial_state()

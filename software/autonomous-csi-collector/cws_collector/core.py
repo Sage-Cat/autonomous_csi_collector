@@ -556,6 +556,8 @@ class SerialWorker(threading.Thread):
         self.pending_command: dict[str, Any] | None = None
         self.pending_command_sent_monotonic: float | None = None
         self.command_ack_timeout_seconds = float(source.get("command_ack_timeout_seconds", 10.0))
+        self._port_lock = threading.Lock()
+        self._current_port: Any | None = None
         self.writer = ChunkWriter(
             run_dir,
             source["source_id"],
@@ -573,6 +575,46 @@ class SerialWorker(threading.Thread):
             run_id=run_dir.name,
             timeout_seconds=self.command_ack_timeout_seconds,
         )
+
+    def _set_current_port(self, port: Any) -> None:
+        with self._port_lock:
+            self._current_port = port
+
+    def _clear_current_port(self, port: Any) -> None:
+        with self._port_lock:
+            if self._current_port is port:
+                self._current_port = None
+
+    def interrupt_io(self, *, force_close: bool = False) -> None:
+        """Interrupt only this worker's current serial I/O.
+
+        ``cancel_read`` and ``cancel_write`` are the pyserial-supported
+        cross-thread interruption mechanism on the Raspberry Pi.  A forced
+        close is reserved for the second, bounded shutdown stage.  Copying the
+        exact port object under the lock ensures that a stale shutdown request
+        cannot close a later reconnect.
+        """
+
+        with self._port_lock:
+            port = self._current_port
+        if port is None:
+            return
+        for method_name in ("cancel_read", "cancel_write"):
+            method = getattr(port, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    # Shutdown remains fail-closed: RunCollector verifies that
+                    # the thread actually exited before it finalizes anything.
+                    pass
+        if force_close:
+            with self._port_lock:
+                if self._current_port is port:
+                    try:
+                        port.close()
+                    except Exception:
+                        pass
 
     def _send_pending_command(self, port: Any) -> None:
         if self.control_bridge.poll(port):
@@ -614,8 +656,9 @@ class SerialWorker(threading.Thread):
                 payload = b"CWS_REBOOT\n"
             else:
                 raise CollectorError("unsupported command kind")
-            port.write(payload)
-            port.flush()
+            written = port.write(payload)
+            if written != len(payload):
+                raise OSError(f"short serial control write: {written}/{len(payload)} bytes")
             self.command_path.unlink(missing_ok=True)
             self.pending_command = command
             self.pending_command_sent_monotonic = time.monotonic()
@@ -686,30 +729,41 @@ class SerialWorker(threading.Thread):
                 try:
                     with self.stats.lock:
                         self.stats.status = "connecting"
-                    port = serial.Serial(port=device, baudrate=baud, timeout=1.0)
+                    port = serial.Serial(
+                        port=device,
+                        baudrate=baud,
+                        timeout=1.0,
+                        write_timeout=1.0,
+                    )
                     connection_epoch += 1
-                    with port:
-                        with self.stats.lock:
-                            self.stats.connections += 1
-                            self.stats.status = "streaming"
-                        self.event_log.write(
-                            "source_connected",
-                            source_id=source_id,
-                            device=device,
-                            resolved_device=str(Path(device).resolve(strict=False)),
-                            baud=baud,
-                            connection_epoch=connection_epoch,
-                        )
-                        while not self.stop_event.is_set():
-                            self._send_pending_command(port)
-                            raw = port.readline()
-                            if not raw:
-                                continue
-                            decoded = raw.decode("utf-8", errors="replace")
-                            self._handle_command_response(decoded)
-                            source_sequence += 1
-                            self.writer.write(decoded, connection_epoch, source_sequence)
+                    self._set_current_port(port)
+                    try:
+                        with port:
+                            with self.stats.lock:
+                                self.stats.connections += 1
+                                self.stats.status = "streaming"
+                            self.event_log.write(
+                                "source_connected",
+                                source_id=source_id,
+                                device=device,
+                                resolved_device=str(Path(device).resolve(strict=False)),
+                                baud=baud,
+                                connection_epoch=connection_epoch,
+                            )
+                            while not self.stop_event.is_set():
+                                self._send_pending_command(port)
+                                raw = port.read_until(expected=b"\n", size=1024 * 1024)
+                                if not raw:
+                                    continue
+                                decoded = raw.decode("utf-8", errors="replace")
+                                self._handle_command_response(decoded)
+                                source_sequence += 1
+                                self.writer.write(decoded, connection_epoch, source_sequence)
+                    finally:
+                        self._clear_current_port(port)
                 except (OSError, serial.SerialException) as exc:
+                    if self.stop_event.is_set():
+                        break
                     with self.stats.lock:
                         self.stats.errors += 1
                         self.stats.status = "disconnected"
@@ -717,6 +771,10 @@ class SerialWorker(threading.Thread):
                         "source_disconnected", source_id=source_id, connection_epoch=connection_epoch, error=str(exc)
                     )
                     self.stop_event.wait(reconnect_seconds)
+                except Exception:
+                    if self.stop_event.is_set():
+                        break
+                    raise
         finally:
             try:
                 self.control_bridge.shutdown()
@@ -1170,11 +1228,29 @@ class RunCollector:
             reason = "service-interrupt"
         finally:
             self.stop_event.set()
+            serial_workers = [worker for worker in workers if isinstance(worker, SerialWorker)]
+            for worker in serial_workers:
+                worker.interrupt_io()
             for worker in workers:
-                worker.join(timeout=10)
+                worker.join(timeout=5)
             alive = [worker.name for worker in workers if worker.is_alive()]
             if alive:
+                for worker in serial_workers:
+                    if worker.is_alive():
+                        worker.interrupt_io(force_close=True)
+                for worker in workers:
+                    if worker.is_alive():
+                        worker.join(timeout=5)
+                alive = [worker.name for worker in workers if worker.is_alive()]
+            if alive:
                 self.event_log.write("worker_shutdown_timeout", workers=alive)
+                if udp_mirror is not None:
+                    udp_mirror.close()
+                self._write_status("failed", "worker-shutdown-timeout")
+                raise CollectorError(
+                    "workers did not stop after serial cancellation and forced close: "
+                    + ", ".join(alive)
+                )
             self.event_log.write("collector_session_stopped", reason=reason)
             if udp_mirror is not None:
                 udp_mirror.close()
