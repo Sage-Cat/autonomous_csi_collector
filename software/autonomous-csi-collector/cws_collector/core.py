@@ -236,20 +236,30 @@ def preflight(config: dict[str, Any], duration_seconds: int, state_dir: Path) ->
     source_results = []
     expected_rate = 0
     for source in enabled_sources(config):
+        source_id = source["source_id"]
         device = Path(source["device"])
+        pending_control_path = state_dir / "control-pending" / f"{source_id}.json"
+        pending_control_exists = pending_control_path.exists()
         exists = device.exists()
         accessible = os.access(device, os.R_OK | os.W_OK) if exists else False
         if not exists:
-            problems.append(f"{source['source_id']}: device does not exist: {device}")
+            problems.append(f"{source_id}: device does not exist: {device}")
         elif not accessible:
-            problems.append(f"{source['source_id']}: device is not read/write: {device}")
+            problems.append(f"{source_id}: device is not read/write: {device}")
+        if pending_control_exists:
+            problems.append(
+                f"{source_id}: unresolved control transaction exists at {pending_control_path}; "
+                "resolve it before arming a new run"
+            )
         source_results.append(
             {
-                "source_id": source["source_id"],
+                "source_id": source_id,
                 "device": str(device),
                 "resolved_device": str(device.resolve(strict=False)),
                 "exists": exists,
                 "accessible": accessible,
+                "pending_control_transaction_path": str(pending_control_path),
+                "pending_control_transaction_exists": pending_control_exists,
             }
         )
         expected_rate += int(source.get("expected_compressed_bytes_per_second", 50_000))

@@ -22,6 +22,7 @@ from cws_collector.core import (
     SourceStats,
     arm_run,
     parse_duration,
+    preflight,
     request_rate,
     request_reboot,
     request_stop,
@@ -90,6 +91,84 @@ class ConfigTests(unittest.TestCase):
         config["live_udp"]["port"] = 70000
         with self.assertRaisesRegex(CollectorError, "live_udp.port"):
             validate_config(config)
+
+
+class PreflightGuardTests(unittest.TestCase):
+    @staticmethod
+    def config() -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "minimum_free_bytes": 1024**3,
+            "sources": [
+                {
+                    "source_id": "esp32-test",
+                    "device": "/dev/null",
+                    "expected_compressed_bytes_per_second": 1,
+                }
+            ],
+        }
+
+    def run_preflight(self, state_dir: Path) -> dict[str, object]:
+        disk_usage = types.SimpleNamespace(free=16 * 1024**3)
+        with (
+            patch.dict(sys.modules, {"serial": types.ModuleType("serial")}),
+            patch.object(core_module.shutil, "disk_usage", return_value=disk_usage),
+        ):
+            return preflight(self.config(), 60, state_dir)
+
+    def test_preflight_rejects_stale_transaction_and_preserves_exact_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            pending_path = state_dir / "control-pending/esp32-test.json"
+            pending_path.parent.mkdir()
+            stale_bytes = b'{"schema_version":"opaque-stale-state","sequence":7}\n'
+            pending_path.write_bytes(stale_bytes)
+
+            result = self.run_preflight(state_dir)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(
+                result["problems"],
+                [
+                    f"esp32-test: unresolved control transaction exists at {pending_path}; "
+                    "resolve it before arming a new run"
+                ],
+            )
+            self.assertEqual(pending_path.read_bytes(), stale_bytes)
+            self.assertTrue(result["sources"][0]["pending_control_transaction_exists"])
+
+    def test_arm_rejects_stale_transaction_without_creating_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            config_path = state_dir / "config.json"
+            config_path.write_text(json.dumps(self.config()), encoding="utf-8")
+            pending_path = state_dir / "control-pending/esp32-test.json"
+            pending_path.parent.mkdir()
+            stale_bytes = b'{"schema_version":"opaque-stale-state","sequence":8}\n'
+            pending_path.write_bytes(stale_bytes)
+            disk_usage = types.SimpleNamespace(free=16 * 1024**3)
+
+            with (
+                patch.dict(sys.modules, {"serial": types.ModuleType("serial")}),
+                patch.object(core_module.shutil, "disk_usage", return_value=disk_usage),
+                self.assertRaisesRegex(
+                    CollectorError,
+                    "esp32-test: unresolved control transaction exists",
+                ),
+            ):
+                arm_run(config_path, state_dir, 60, "must-not-arm")
+
+            self.assertEqual(pending_path.read_bytes(), stale_bytes)
+            self.assertFalse((state_dir / "active.json").exists())
+            self.assertFalse((state_dir / "runs").exists())
+
+    def test_ordinary_preflight_passes_without_pending_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_preflight(Path(temporary))
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["problems"], [])
+            self.assertFalse(result["sources"][0]["pending_control_transaction_exists"])
 
 
 class CommandTests(unittest.TestCase):
