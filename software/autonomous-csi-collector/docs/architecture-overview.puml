@@ -1,0 +1,63 @@
+@startuml
+!theme plain
+top to bottom direction
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam defaultFontName "DejaVu Sans"
+skinparam defaultFontSize 13
+skinparam ArrowColor #3D4A5C
+skinparam ArrowThickness 1
+skinparam ArrowFontSize 11
+skinparam linetype ortho
+skinparam component {
+  BackgroundColor #E8F1F8
+  BorderColor #286486
+  FontColor #1F2937
+}
+skinparam rectangle {
+  BackgroundColor #F7F9FC
+  BorderColor #3D4A5C
+  FontColor #1F2937
+}
+skinparam database {
+  BackgroundColor #E8F3E6
+  BorderColor #3F6B3A
+  FontColor #1F2937
+}
+skinparam note {
+  BackgroundColor #FFF4CE
+  BorderColor #8A6D1D
+  FontColor #1F2937
+}
+
+rectangle "Deployment-owned inputs" as inputs {
+  rectangle "ESP32 sensing firmware\nexternal source" as firmware
+  rectangle "Authorized operator / optional controller\nexternal policy owner" as operator
+}
+
+rectangle "Autonomous CSI Collector" as collector {
+  component "cws-collector\nCLI + service" as service
+  component "Serial ingest + control bridge\ncws-firmware-control/1" as bridge
+  component "Recorder + finalizer\ncws-source-record/2" as recorder
+  component "Optional best-effort\nUDP mirror" as mirror
+
+  service -down-> bridge
+  bridge -down-> recorder
+  bridge -right-> mirror
+}
+
+database "Operator-owned run directory\nruntime output outside repository" as run
+
+firmware -- bridge
+operator -- service
+recorder -down-> run : finalized archive
+bridge -down-> run : transaction ledger
+mirror ..> operator : best-effort JSON/UDP
+
+note bottom of run
+  The finalized local copy is authoritative.
+  The collector emits neutral transport facts, not M1-M4 verdicts.
+end note
+@enduml

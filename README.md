@@ -4,6 +4,13 @@
 service. Its implementation is `software/autonomous-csi-collector`; concrete
 operational records and outcomes are outside this repository.
 
+## Architecture
+
+![Autonomous CSI Collector architecture](software/autonomous-csi-collector/docs/architecture-overview.svg)
+
+The rendered overview is generated from the
+[PlantUML source](software/autonomous-csi-collector/docs/architecture-overview.puml).
+
 The maintained bridge writes backward-compatible `cws-source-record/2`
 envelopes and an append-only `cws-actuation-transaction/1` ledger. It verifies
 firmware rate-change postconditions and records bounded rollback outcomes, but
