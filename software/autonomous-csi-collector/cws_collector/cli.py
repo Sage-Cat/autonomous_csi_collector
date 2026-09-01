@@ -13,6 +13,7 @@ from cws_collector.core import (
     parse_duration,
     preflight,
     request_stop,
+    request_legacy_rate,
     request_rate,
     request_reboot,
     serial_inventory,
@@ -69,6 +70,20 @@ def build_parser() -> argparse.ArgumentParser:
     rate.add_argument("--transaction-id")
     rate.add_argument("--wait-seconds", type=float, default=5.0)
     rate.set_defaults(handler=handle_rate)
+
+    legacy_rate = subparsers.add_parser(
+        "set-legacy-rate",
+        help="explicitly queue the fail-closed legacy CWS_SET_PING_HZ compatibility command",
+    )
+    legacy_rate.add_argument("--source", required=True)
+    legacy_rate.add_argument("--hz", type=int, required=True)
+    legacy_rate.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=30.0,
+        help="wait up to 30 seconds for legacy acknowledgement and heartbeat verification",
+    )
+    legacy_rate.set_defaults(handler=handle_legacy_rate)
 
     reboot = subparsers.add_parser("reboot-source", help="request an acknowledged ESP reboot")
     reboot.add_argument("--source", required=True)
@@ -136,6 +151,19 @@ def handle_rate(args: argparse.Namespace) -> int:
         decision_sha256=args.decision_sha256,
         transaction_id=args.transaction_id,
     )
+    if args.wait_seconds <= 0:
+        print_json({**command, "status": "queued"})
+        return 0
+    result = wait_rate_result(args.state_dir, command["command_id"], args.wait_seconds)
+    if result is None:
+        print_json({**command, "status": "timeout"})
+        return 3
+    print_json(result)
+    return 0 if result.get("status") == "applied" else 4
+
+
+def handle_legacy_rate(args: argparse.Namespace) -> int:
+    command = request_legacy_rate(args.state_dir, args.source, args.hz)
     if args.wait_seconds <= 0:
         print_json({**command, "status": "queued"})
         return 0

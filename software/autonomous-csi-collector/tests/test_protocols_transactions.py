@@ -21,10 +21,13 @@ from cws_collector.protocols import (
 )
 from cws_collector.transactions import (
     FirmwareControlBridge,
+    LegacyRateControlBridge,
+    TRANSACTION_SCHEMA_LEGACY_RATE_V1,
     TRANSACTION_SCHEMA_V1,
     TRANSACTION_SCHEMA_V2,
     TransactionLedger,
     canonical_sha256,
+    queue_legacy_rate_transaction,
     queue_rate_transaction,
     transaction_ledger_summary,
 )
@@ -84,6 +87,13 @@ def reply_for(
         f" transaction_id={transaction_id or fields['transaction_id']}"
         f" status={status} reason={reason} boot_epoch={boot} config_epoch={config}"
         f" effective_ping_hz={hz} active={int(hz != 0)}\n"
+    )
+
+
+def legacy_heartbeat(hz: int, boot: int = 7) -> str:
+    return (
+        "CWSLAB_TIMING_HEARTBEAT node_label=source-a fw_version=1.4.1 "
+        f"boot_epoch={boot} ping_hz={hz}\n"
     )
 
 
@@ -161,6 +171,271 @@ class SourceRecordTests(unittest.TestCase):
             parse_firmware_reply(base + " status=ok")
         with self.assertRaisesRegex(ValueError, "inconsistent"):
             parse_firmware_reply(base.removesuffix("active=0") + "active=1")
+
+
+class LegacyRateBridgeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.state_dir = Path(self.temporary.name)
+        self.run_dir = self.state_dir / "runs" / "run-test"
+        self.run_dir.mkdir(parents=True)
+        self.active = {"run_id": "run-test", "run_dir": str(self.run_dir)}
+        self.clock = FakeClock()
+        self.port = FakePort()
+
+    def bridge(self, hz: int = 20) -> LegacyRateControlBridge:
+        queue_legacy_rate_transaction(self.state_dir, self.active, "source-a", hz)
+        return LegacyRateControlBridge(
+            state_dir=self.state_dir,
+            run_dir=self.run_dir,
+            source_id="source-a",
+            run_id="run-test",
+            timeout_seconds=1,
+            now_ns=self.clock,
+            monotonic_ns=self.clock,
+        )
+
+    def test_exact_ack_and_later_same_boot_heartbeat_are_required(self) -> None:
+        bridge = self.bridge()
+        bridge.observe_line(legacy_heartbeat(10))
+        self.assertTrue(bridge.poll(self.port))
+        self.assertEqual(self.port.lines, ["CWS_SET_PING_HZ 20\n"])
+        bridge.handle_line("CWS_CONFIG_APPLIED ping_hz=20 suffix=must-not-pass\n")
+        self.assertTrue((self.state_dir / "control-pending/source-a.json").exists())
+        bridge.handle_line("CWS_CONFIG_APPLIED ping_hz=20\n")
+        bridge.observe_line(legacy_heartbeat(20))  # Same sample instant as the acknowledgement is not later.
+        self.assertTrue((self.state_dir / "control-pending/source-a.json").exists())
+        self.clock.advance(0.1)
+        bridge.observe_line(legacy_heartbeat(20))
+        result = json.loads((self.state_dir / "control-status/source-a.json").read_text())
+        self.assertEqual(result["transaction_status"], "committed")
+        self.assertEqual(result["terminal_facts"]["postcondition"]["heartbeat"]["boot_epoch"], 7)
+        summary = transaction_ledger_summary(self.run_dir / "command-transactions.ndjson")
+        transaction = next(iter(summary["transactions"].values()))
+        self.assertEqual(transaction["schema_version"], TRANSACTION_SCHEMA_LEGACY_RATE_V1)
+
+    def test_mismatched_apply_ack_is_preserved_in_terminal_facts(self) -> None:
+        bridge = self.bridge()
+        bridge.observe_line(legacy_heartbeat(10))
+        bridge.poll(self.port)
+        bridge.handle_line("CWS_CONFIG_APPLIED ping_hz=30\n")
+        bridge.poll(self.port)
+        self.assertEqual(self.port.lines[-1], "CWS_SET_PING_HZ 10\n")
+        bridge.handle_line("CWS_CONFIG_APPLIED ping_hz=10\n")
+        self.clock.advance(0.1)
+        bridge.observe_line(legacy_heartbeat(10))
+        result = json.loads((self.state_dir / "control-status/source-a.json").read_text())
+        self.assertEqual(result["transaction_status"], "rolled-back")
+        self.assertEqual(result["terminal_facts"]["apply_ack"]["ping_hz"], 30)
+
+    def test_restart_after_mismatched_apply_ack_resumes_the_pending_restore(self) -> None:
+        bridge = self.bridge()
+        bridge.observe_line(legacy_heartbeat(10))
+        bridge.poll(self.port)
+        bridge.handle_line("CWS_CONFIG_APPLIED ping_hz=30\n")
+        restarted = LegacyRateControlBridge(
+            state_dir=self.state_dir,
+            run_dir=self.run_dir,
+            source_id="source-a",
+            run_id="run-test",
+            timeout_seconds=1,
+            now_ns=self.clock,
+            monotonic_ns=self.clock,
+        )
+        restarted.poll(self.port)
+        self.assertEqual(self.port.lines[-1], "CWS_SET_PING_HZ 10\n")
+
+    def test_terminal_ledger_recovery_reconstructs_status_without_duplicate_event(self) -> None:
+        bridge = self.bridge()
+        bridge.observe_line(legacy_heartbeat(10))
+        bridge.poll(self.port)
+        pending = self.state_dir / "control-pending/source-a.json"
+        crash_window_state = pending.read_bytes()
+        bridge.shutdown()
+        pending.write_bytes(crash_window_state)
+        (self.state_dir / "control-status/source-a.json").unlink()
+        recovered = LegacyRateControlBridge(
+            state_dir=self.state_dir,
+            run_dir=self.run_dir,
+            source_id="source-a",
+            run_id="run-test",
+            timeout_seconds=1,
+            now_ns=self.clock,
+            monotonic_ns=self.clock,
+        )
+        self.assertIsNone(recovered.state)
+        self.assertFalse(pending.exists())
+        events = [
+            json.loads(line)["event_type"]
+            for line in (self.run_dir / "command-transactions.ndjson").read_text().splitlines()
+        ]
+        self.assertEqual(events.count("rollback-failed"), 1)
+        self.assertEqual(
+            json.loads((self.state_dir / "control-status/source-a.json").read_text())["reason"],
+            "recovered-terminal-ledger",
+        )
+
+    def test_postcondition_mismatch_restores_prior_rate_and_verifies_it(self) -> None:
+        bridge = self.bridge()
+        bridge.observe_line(legacy_heartbeat(10))
+        bridge.poll(self.port)
+        bridge.handle_line("CWS_CONFIG_APPLIED ping_hz=20\n")
+        self.clock.advance(0.1)
+        bridge.observe_line(legacy_heartbeat(30))
+        bridge.poll(self.port)
+        self.assertEqual(self.port.lines[-1], "CWS_SET_PING_HZ 10\n")
+        bridge.handle_line("CWS_CONFIG_APPLIED ping_hz=10\n")
+        self.clock.advance(0.1)
+        bridge.observe_line(legacy_heartbeat(10))
+        result = json.loads((self.state_dir / "control-status/source-a.json").read_text())
+        self.assertEqual(result["transaction_status"], "rolled-back")
+        self.assertTrue(result["terminal_facts"]["rollback"]["verified"])
+
+    def test_later_explicit_request_to_the_prior_rate_uses_the_same_verification(self) -> None:
+        first = self.bridge()
+        first.observe_line(legacy_heartbeat(10))
+        first.poll(self.port)
+        first.handle_line("CWS_CONFIG_APPLIED ping_hz=20\n")
+        self.clock.advance(0.1)
+        first.observe_line(legacy_heartbeat(20))
+
+        queue_legacy_rate_transaction(self.state_dir, self.active, "source-a", 10)
+        second = LegacyRateControlBridge(
+            state_dir=self.state_dir,
+            run_dir=self.run_dir,
+            source_id="source-a",
+            run_id="run-test",
+            timeout_seconds=1,
+            now_ns=self.clock,
+            monotonic_ns=self.clock,
+        )
+        second.observe_line(legacy_heartbeat(20))
+        second.poll(self.port)
+        self.assertEqual(self.port.lines[-1], "CWS_SET_PING_HZ 10\n")
+        second.handle_line("CWS_CONFIG_APPLIED ping_hz=10\n")
+        self.clock.advance(0.1)
+        second.observe_line(legacy_heartbeat(10))
+        result = json.loads((self.state_dir / "control-status/source-a.json").read_text())
+        self.assertEqual(result["transaction_status"], "committed")
+        self.assertEqual(result["hz"], 10)
+
+    def test_postcondition_timeout_then_restore_timeout_is_explicit_failure(self) -> None:
+        bridge = self.bridge()
+        bridge.observe_line(legacy_heartbeat(10))
+        bridge.poll(self.port)
+        bridge.handle_line("CWS_CONFIG_APPLIED ping_hz=20\n")
+        self.clock.advance(2)
+        bridge.poll(self.port)
+        bridge.poll(self.port)
+        self.assertEqual(self.port.lines[-1], "CWS_SET_PING_HZ 10\n")
+        self.clock.advance(2)
+        bridge.poll(self.port)
+        result = json.loads((self.state_dir / "control-status/source-a.json").read_text())
+        self.assertEqual(result["transaction_status"], "rollback-failed")
+        self.assertEqual(result["terminal_facts"]["rollback"]["reason"], "restore-ack-timeout")
+
+    def test_apply_ack_timeout_attempts_restore_instead_of_claiming_failed_safe(self) -> None:
+        bridge = self.bridge()
+        bridge.observe_line(legacy_heartbeat(10))
+        bridge.poll(self.port)
+        self.clock.advance(2)
+        bridge.poll(self.port)
+        bridge.poll(self.port)
+        self.assertEqual(self.port.lines[-1], "CWS_SET_PING_HZ 10\n")
+        self.assertTrue((self.state_dir / "control-pending/source-a.json").exists())
+
+    def test_shutdown_after_write_records_unverified_rollback(self) -> None:
+        bridge = self.bridge()
+        bridge.observe_line(legacy_heartbeat(10))
+        bridge.poll(self.port)
+        bridge.shutdown()
+        result = json.loads((self.state_dir / "control-status/source-a.json").read_text())
+        self.assertEqual(result["transaction_status"], "rollback-failed")
+        self.assertEqual(result["reason"], "collector-stopped-with-unverified-legacy-state")
+
+    def test_shutdown_adopts_and_seals_queued_legacy_command(self) -> None:
+        bridge = self.bridge()
+        self.assertIsNone(bridge.state)
+        self.assertTrue((self.state_dir / "control/source-a.json").exists())
+        bridge.shutdown()
+        result = json.loads((self.state_dir / "control-status/source-a.json").read_text())
+        self.assertEqual(result["transaction_status"], "failed-safe")
+        self.assertEqual(result["reason"], "collector-stopped-before-legacy-mutation")
+        self.assertFalse((self.state_dir / "control/source-a.json").exists())
+        self.assertFalse((self.state_dir / "control-pending/source-a.json").exists())
+
+    def test_exact_rejection_is_safe_only_when_it_reports_the_captured_prior_rate(self) -> None:
+        bridge = self.bridge()
+        bridge.observe_line(legacy_heartbeat(10))
+        bridge.poll(self.port)
+        response = (
+            "CWS_CONFIG_REJECTED requested_ping_hz=20 current_ping_hz=10 "
+            "error=ESP_ERR_INVALID_ARG\n"
+        )
+        bridge.handle_line(response)
+        result = json.loads((self.state_dir / "control-status/source-a.json").read_text())
+        self.assertEqual(result["transaction_status"], "failed-safe")
+        self.assertEqual(result["terminal_facts"]["rejection"]["response"], response.rstrip())
+
+    def test_malformed_or_state_mismatched_rejection_never_passes_as_safe(self) -> None:
+        bridge = self.bridge()
+        bridge.observe_line(legacy_heartbeat(10))
+        bridge.poll(self.port)
+        bridge.handle_line("CWS_CONFIG_REJECTED requested_ping_hz=20 current_ping_hz=10\n")
+        self.assertTrue((self.state_dir / "control-pending/source-a.json").exists())
+        bridge.handle_line(
+            "CWS_CONFIG_REJECTED requested_ping_hz=4294967296 current_ping_hz=10 "
+            "error=ESP_ERR_INVALID_ARG\n"
+        )
+        self.assertTrue((self.state_dir / "control-pending/source-a.json").exists())
+        bridge.handle_line(
+            "CWS_CONFIG_REJECTED requested_ping_hz=20 current_ping_hz=30 error=ESP_ERR_INVALID_ARG\n"
+        )
+        bridge.poll(self.port)
+        self.assertEqual(self.port.lines[-1], "CWS_SET_PING_HZ 10\n")
+        state = json.loads((self.state_dir / "control-pending/source-a.json").read_text())
+        self.assertEqual(state["rejection"]["current_ping_hz"], 30)
+
+    def test_corrupt_unresolved_state_fails_closed_before_serial_write(self) -> None:
+        bridge = self.bridge()
+        bridge.observe_line(legacy_heartbeat(10))
+        bridge.poll(self.port)
+        pending = self.state_dir / "control-pending/source-a.json"
+        corrupt = json.loads(pending.read_text())
+        corrupt["prior_heartbeat"] = {"ping_hz": "10"}
+        pending.write_text(json.dumps(corrupt), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "invalid-persisted-legacy-rate-transaction"):
+            LegacyRateControlBridge(
+                state_dir=self.state_dir,
+                run_dir=self.run_dir,
+                source_id="source-a",
+                run_id="run-test",
+                timeout_seconds=1,
+                now_ns=self.clock,
+                monotonic_ns=self.clock,
+            )
+
+    def test_restart_retains_unresolved_legacy_state_and_blocks_another_request(self) -> None:
+        bridge = self.bridge()
+        bridge.observe_line(legacy_heartbeat(10))
+        bridge.poll(self.port)
+        bridge.handle_line("CWS_CONFIG_APPLIED ping_hz=20\n")
+        restarted = LegacyRateControlBridge(
+            state_dir=self.state_dir,
+            run_dir=self.run_dir,
+            source_id="source-a",
+            run_id="run-test",
+            timeout_seconds=1,
+            now_ns=self.clock,
+            monotonic_ns=self.clock,
+        )
+        with self.assertRaisesRegex(RuntimeError, "already pending"):
+            queue_legacy_rate_transaction(self.state_dir, self.active, "source-a", 10)
+        self.clock.advance(2)
+        restarted.poll(self.port)
+        restarted.poll(self.port)
+        self.assertEqual(self.port.lines[-1], "CWS_SET_PING_HZ 10\n")
 
 
 class TransactionBridgeTests(unittest.TestCase):
@@ -441,6 +716,38 @@ class TransactionBridgeTests(unittest.TestCase):
 
 
 class TransactionQueueTests(unittest.TestCase):
+    def test_versioned_bridge_rejects_legacy_schema_even_if_command_kind_is_set_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            run_dir = state_dir / "runs/run-test"
+            run_dir.mkdir(parents=True)
+            command_path = state_dir / "control/source-a.json"
+            command_path.parent.mkdir()
+            command_path.write_text(
+                json.dumps(
+                    {
+                        "protocol": "cws-firmware-control/1",
+                        "schema_version": TRANSACTION_SCHEMA_LEGACY_RATE_V1,
+                        "command_id": "legacy-confused",
+                        "transaction_id": "legacy-confused",
+                        "kind": "set-rate",
+                        "run_id": "run-test",
+                        "source_id": "source-a",
+                        "hz": 20,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            bridge = FirmwareControlBridge(
+                state_dir=state_dir,
+                run_dir=run_dir,
+                source_id="source-a",
+                run_id="run-test",
+                timeout_seconds=1,
+            )
+            with self.assertRaisesRegex(ValueError, "invalid-queued-command-transaction"):
+                bridge.poll(FakePort())
+
     def test_invalid_rate_never_creates_command_or_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary)
@@ -728,6 +1035,25 @@ class CliTransactionTests(unittest.TestCase):
             decision_sha256=decision,
             transaction_id="daemon-decision-01",
         )
+
+    def test_legacy_rate_is_a_separate_explicit_cli_opt_in(self) -> None:
+        command = {"command_id": "legacy-command", "kind": "legacy-set-rate", "hz": 20}
+        with patch("cws_collector.cli.request_legacy_rate", return_value=command) as request, redirect_stdout(io.StringIO()):
+            result = cli.main(
+                [
+                    "--state-dir", "/tmp/cws-cli-test", "set-legacy-rate", "--source", "source-a",
+                    "--hz", "20", "--wait-seconds", "0",
+                ]
+            )
+        self.assertEqual(result, 0)
+        request.assert_called_once_with(Path("/tmp/cws-cli-test"), "source-a", 20)
+
+    def test_legacy_wait_default_is_longer_without_changing_set_rate(self) -> None:
+        parser = cli.build_parser()
+        legacy = parser.parse_args(["set-legacy-rate", "--source", "source-a", "--hz", "20"])
+        ordinary = parser.parse_args(["set-rate", "--source", "source-a", "--hz", "20"])
+        self.assertEqual(legacy.wait_seconds, 30.0)
+        self.assertEqual(ordinary.wait_seconds, 5.0)
 
 
 class EvidenceFactsTests(unittest.TestCase):

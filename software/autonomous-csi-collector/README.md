@@ -72,6 +72,31 @@ postcondition is honestly sealed `rollback-failed`. The legacy reboot command
 remains separate; neither control path changes AP, channel, BSSID, SSID, or
 another WLAN-owned setting.
 
+For a specifically deployed legacy ESP32 firmware 1.4.1, and only when its
+documented unversioned wire command is required, use the explicit opt-in:
+
+```sh
+cws-collector set-legacy-rate --source <source-id> --hz <0..50>
+```
+
+Ordinary `set-rate` is unchanged: it always uses `cws-firmware-control/1`.
+`set-legacy-rate` is a separate, fail-closed transaction for exactly
+`CWS_SET_PING_HZ <0..50>` and is sent only by the collector's serial worker.
+Its legacy-only CLI wait default is 30 seconds to allow both acknowledgement
+and the required subsequent heartbeat; ordinary `set-rate` retains its
+five-second default.
+Before writing it, that worker requires a fresh parsed heartbeat from the
+active source containing `ping_hz` and `boot_epoch`; it persists that prior
+state. Success requires the exact `CWS_CONFIG_APPLIED ping_hz=<requested>`
+line and a later heartbeat from the same boot reporting the requested rate.
+An acknowledged mutation without that postcondition triggers one bounded
+restore to the captured prior rate; both restore acknowledgement and
+same-boot heartbeat verification are required to call it rolled back. An
+unresolved legacy transaction blocks new commands and arming. The append-only
+transaction ledger is authoritative; the replaceable status JSON is a
+compatibility view. This compatibility path does not establish firmware build,
+device, or deployment provenance.
+
 Finalization writes `evidence-facts.json` with neutral transport facts only:
 observed sequence gaps/duplicates, connection and epoch facts, fixed two-second
 pair-window coverage counts, and verified transaction-ledger hashes. The run

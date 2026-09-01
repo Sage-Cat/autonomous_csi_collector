@@ -15,12 +15,23 @@ from cws_collector.protocols import FIRMWARE_CONTROL_V1, FirmwareReply, parse_fi
 
 TRANSACTION_SCHEMA_V1 = "cws-actuation-transaction/1"
 TRANSACTION_SCHEMA_V2 = "cws-actuation-transaction/2"
-TRANSACTION_SCHEMAS = {TRANSACTION_SCHEMA_V1, TRANSACTION_SCHEMA_V2}
+TRANSACTION_SCHEMA_LEGACY_RATE_V1 = "cws-legacy-rate-transaction/1"
+TRANSACTION_SCHEMAS = {TRANSACTION_SCHEMA_V1, TRANSACTION_SCHEMA_V2, TRANSACTION_SCHEMA_LEGACY_RATE_V1}
+VERSIONED_TRANSACTION_SCHEMAS = {TRANSACTION_SCHEMA_V1, TRANSACTION_SCHEMA_V2}
 # Compatibility import for callers that explicitly mean the original schema.
 TRANSACTION_SCHEMA = TRANSACTION_SCHEMA_V1
 _TERMINAL = {"committed", "rolled-back", "failed-safe", "rollback-failed"}
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_LEGACY_HEARTBEAT = re.compile(
+    r"^CWSLAB_TIMING_HEARTBEAT(?: [A-Za-z0-9_.-]+=[^\s=]+)+\r?\n?\Z"
+)
+_LEGACY_APPLIED = re.compile(r"^CWS_CONFIG_APPLIED ping_hz=([0-9]|[1-4][0-9]|50)\r?\n?\Z")
+_LEGACY_REJECTED = re.compile(
+    r"^CWS_CONFIG_REJECTED requested_ping_hz=(0|[1-9][0-9]{0,9})"
+    r" current_ping_hz=([0-9]|[1-4][0-9]|50) error=(ESP_ERR_[A-Z0-9_]+)\r?\n?\Z"
+)
+LEGACY_HEARTBEAT_MAX_AGE_NS = 15 * 1_000_000_000
 
 
 def canonical_json(data: Any) -> bytes:
@@ -339,6 +350,588 @@ def queue_rate_transaction(
     return command
 
 
+def queue_legacy_rate_transaction(
+    state_dir: Path,
+    active: dict[str, Any],
+    source_id: str,
+    hz: int,
+) -> dict[str, Any]:
+    """Queue the explicitly opted-in, uncorrelated legacy rate command.
+
+    The command is intentionally a separate queue kind: the normal set-rate
+    request must remain a cws-firmware-control/1 transaction.
+    """
+
+    if isinstance(hz, bool) or not isinstance(hz, int) or not 0 <= hz <= 50:
+        raise ValueError("invalid-requested-ping-hz")
+    token = time.strftime("%Y%m%dT%H%M%Sz", time.gmtime())
+    transaction_id = f"legacy-{token}-{uuid.uuid4().hex[:8]}"
+    command = {
+        "protocol": "cws-legacy-ping-rate/1",
+        "schema_version": TRANSACTION_SCHEMA_LEGACY_RATE_V1,
+        "command_id": transaction_id,
+        "transaction_id": transaction_id,
+        "created_wall_time_ns": time.time_ns(),
+        "hz": hz,
+        "kind": "legacy-set-rate",
+        "run_id": active["run_id"],
+        "source_id": source_id,
+    }
+    control = state_dir / "control" / f"{source_id}.json"
+    pending = state_dir / "control-pending" / f"{source_id}.json"
+    control.parent.mkdir(parents=True, exist_ok=True)
+    with (control.parent / ".queue.lock").open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if control.exists() or pending.exists():
+            raise RuntimeError(f"a command is already pending for {source_id}")
+        _atomic_json(control, command)
+        run_dir = Path(active.get("run_dir", state_dir / "runs" / active["run_id"]))
+        TransactionLedger(run_dir / "command-transactions.ndjson").append(
+            "queued",
+            schema_version=TRANSACTION_SCHEMA_LEGACY_RATE_V1,
+            transaction_id=transaction_id,
+            command_id=transaction_id,
+            source_id=source_id,
+            run_id=active["run_id"],
+            requested_ping_hz=hz,
+            wire_command=f"CWS_SET_PING_HZ {hz}",
+        )
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return command
+
+
+class LegacyRateControlBridge:
+    """Fail-closed state machine for the deployed pre-protocol rate command.
+
+    Legacy replies carry no command identity.  A fresh heartbeat therefore
+    supplies the only usable before/after state, and any ambiguity is retained
+    in the transaction ledger rather than converted into a successful status.
+    """
+
+    def __init__(
+        self,
+        *,
+        state_dir: Path,
+        run_dir: Path,
+        source_id: str,
+        run_id: str,
+        timeout_seconds: float,
+        now_ns: Callable[[], int] = time.time_ns,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+    ):
+        self.source_id = source_id
+        self.run_id = run_id
+        self.timeout_ns = max(1, int(timeout_seconds * 1_000_000_000))
+        self.now_ns = now_ns
+        self.monotonic_ns = monotonic_ns
+        self.command_path = state_dir / "control" / f"{source_id}.json"
+        self.pending_path = state_dir / "control-pending" / f"{source_id}.json"
+        self.status_path = state_dir / "control-status" / f"{source_id}.json"
+        self.ledger = TransactionLedger(run_dir / "command-transactions.ndjson", now_ns)
+        self.last_heartbeat: dict[str, Any] | None = None
+        self.state = self._load_pending()
+        if self.state is not None and isinstance(self.state.get("terminal_intent"), dict):
+            intent = self.state["terminal_intent"]
+            self._seal_terminal(
+                intent["terminal"], intent["reason"], intent["terminal_facts"], intent["terminal_facts_sha256"]
+            )
+
+    @staticmethod
+    def _valid_int(value: Any, minimum: int = 0, maximum: int | None = None) -> bool:
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, int)
+            and value >= minimum
+            and (maximum is None or value <= maximum)
+        )
+
+    @classmethod
+    def _valid_heartbeat(cls, heartbeat: Any) -> bool:
+        return (
+            isinstance(heartbeat, dict)
+            and cls._valid_int(heartbeat.get("ping_hz"), 0, 50)
+            and cls._valid_int(heartbeat.get("boot_epoch"))
+            and cls._valid_int(heartbeat.get("observed_monotonic_ns"))
+            and cls._valid_int(heartbeat.get("observed_wall_time_ns"))
+            and isinstance(heartbeat.get("fields"), dict)
+            and all(isinstance(key, str) and isinstance(value, str) for key, value in heartbeat["fields"].items())
+        )
+
+    @classmethod
+    def _valid_observed_ack(cls, ack: Any, expected_hz: int) -> bool:
+        return (
+            isinstance(ack, dict)
+            and isinstance(ack.get("response"), str)
+            and cls._valid_int(ack.get("ping_hz"), 0, 50)
+            and ack.get("expected_ping_hz") == expected_hz
+        )
+
+    @classmethod
+    def _valid_exact_ack(cls, ack: Any, expected_hz: int) -> bool:
+        return cls._valid_observed_ack(ack, expected_hz) and ack["ping_hz"] == expected_hz
+
+    @classmethod
+    def _valid_rejection(cls, rejection: Any) -> bool:
+        return (
+            isinstance(rejection, dict)
+            and isinstance(rejection.get("response"), str)
+            and cls._valid_int(rejection.get("requested_ping_hz"), 0, 4_294_967_295)
+            and cls._valid_int(rejection.get("current_ping_hz"), 0, 50)
+            and isinstance(rejection.get("error"), str)
+            and re.fullmatch(r"ESP_ERR_[A-Z0-9_]+", rejection["error"]) is not None
+        )
+
+    def _load_pending(self) -> dict[str, Any] | None:
+        if not self.pending_path.exists():
+            return None
+        state = json.loads(self.pending_path.read_text(encoding="utf-8"))
+        if state.get("kind") != "legacy-set-rate":
+            return None
+        if (
+            state.get("schema_version") != TRANSACTION_SCHEMA_LEGACY_RATE_V1
+            or state.get("protocol") != "cws-legacy-ping-rate/1"
+            or state.get("source_id") != self.source_id
+            or state.get("run_id") != self.run_id
+            or not isinstance(state.get("transaction_id"), str)
+            or not _ID.fullmatch(state["transaction_id"])
+            or state.get("command_id") != state["transaction_id"]
+            or isinstance(state.get("hz"), bool)
+            or not isinstance(state.get("hz"), int)
+            or not 0 <= state["hz"] <= 50
+            or state.get("phase")
+            not in {
+                "queued",
+                "apply-await-ack",
+                "await-postcondition",
+                "restore-pending",
+                "restore-await-ack",
+                "await-restore-postcondition",
+            }
+            or not isinstance(state.get("rollback"), dict)
+            or not isinstance(state["rollback"].get("attempted"), bool)
+        ):
+            raise ValueError("invalid-persisted-legacy-rate-transaction")
+        phase = state["phase"]
+        prior_required = phase != "queued"
+        prior = state.get("prior_heartbeat")
+        if prior_required and not self._valid_heartbeat(prior):
+            raise ValueError("invalid-persisted-legacy-rate-transaction")
+        if phase == "queued":
+            if not self._valid_int(state.get("precondition_deadline_wall_time_ns")) or prior is not None:
+                raise ValueError("invalid-persisted-legacy-rate-transaction")
+        if phase in {"apply-await-ack", "restore-await-ack", "await-postcondition", "await-restore-postcondition"}:
+            if not self._valid_int(state.get("deadline_wall_time_ns")):
+                raise ValueError("invalid-persisted-legacy-rate-transaction")
+        if phase in {"apply-await-ack", "restore-await-ack"} and not self._valid_int(
+            state.get("sent_monotonic_ns")
+        ):
+            raise ValueError("invalid-persisted-legacy-rate-transaction")
+        if phase == "await-postcondition":
+            if not self._valid_exact_ack(state.get("apply_ack"), state["hz"]) or not self._valid_int(
+                state.get("ack_monotonic_ns")
+            ):
+                raise ValueError("invalid-persisted-legacy-rate-transaction")
+        if phase == "await-restore-postcondition":
+            assert isinstance(prior, dict)
+            if not self._valid_exact_ack(state.get("restore_ack"), prior["ping_hz"]) or not self._valid_int(
+                state.get("ack_monotonic_ns")
+            ):
+                raise ValueError("invalid-persisted-legacy-rate-transaction")
+        rejection = state.get("rejection")
+        if rejection is not None and not self._valid_rejection(rejection):
+            raise ValueError("invalid-persisted-legacy-rate-transaction")
+        if state.get("apply_ack") is not None and not self._valid_observed_ack(state["apply_ack"], state["hz"]):
+            raise ValueError("invalid-persisted-legacy-rate-transaction")
+        if state.get("restore_ack") is not None and (
+            not isinstance(prior, dict) or not self._valid_observed_ack(state["restore_ack"], prior["ping_hz"])
+        ):
+            raise ValueError("invalid-persisted-legacy-rate-transaction")
+        if state.get("ack") is not None and not (
+            self._valid_observed_ack(state["ack"], state["hz"])
+            or (isinstance(prior, dict) and self._valid_observed_ack(state["ack"], prior["ping_hz"]))
+        ):
+            raise ValueError("invalid-persisted-legacy-rate-transaction")
+        transaction = transaction_ledger_summary(self.ledger.path)["transactions"].get(
+            state["transaction_id"]
+        )
+        if transaction is not None and transaction.get("schema_version") != TRANSACTION_SCHEMA_LEGACY_RATE_V1:
+            raise ValueError("persisted-legacy-rate-transaction-ledger-mismatch")
+        if transaction is not None and transaction.get("terminal") in _TERMINAL:
+            terminal = transaction["terminal"]
+            facts = transaction["terminal_facts"]
+            facts_sha256 = transaction["terminal_facts_sha256"]
+            existing_status: dict[str, Any] | None = None
+            if self.status_path.exists():
+                try:
+                    existing_status = json.loads(self.status_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    existing_status = None
+            if (
+                existing_status is None
+                or existing_status.get("schema_version") != TRANSACTION_SCHEMA_LEGACY_RATE_V1
+                or existing_status.get("terminal_facts_sha256") != facts_sha256
+            ):
+                _atomic_json(
+                    self.status_path,
+                    {
+                        "schema_version": TRANSACTION_SCHEMA_LEGACY_RATE_V1,
+                        "command_id": state["command_id"],
+                        "transaction_id": state["transaction_id"],
+                        "source_id": self.source_id,
+                        "run_id": self.run_id,
+                        "hz": state["hz"],
+                        "status": "applied" if terminal == "committed" else "rejected",
+                        "transaction_status": terminal,
+                        "reason": "recovered-terminal-ledger",
+                        "responded_wall_time_ns": self.now_ns(),
+                        "terminal_facts": facts,
+                        "terminal_facts_sha256": facts_sha256,
+                    },
+                )
+            self.pending_path.unlink(missing_ok=True)
+            return None
+        intent = state.get("terminal_intent")
+        if intent is not None and (
+            not isinstance(intent, dict)
+            or intent.get("terminal") not in _TERMINAL
+            or not isinstance(intent.get("reason"), str)
+            or not isinstance(intent.get("terminal_facts"), dict)
+            or intent.get("terminal_facts_sha256") != canonical_sha256(intent["terminal_facts"])
+        ):
+            raise ValueError("invalid-persisted-legacy-rate-transaction")
+        return state
+
+    def _save(self) -> None:
+        assert self.state is not None
+        _atomic_json(self.pending_path, self.state)
+
+    def _event(self, event_type: str, **fields: Any) -> None:
+        assert self.state is not None
+        self.ledger.append(
+            event_type,
+            schema_version=TRANSACTION_SCHEMA_LEGACY_RATE_V1,
+            source_id=self.source_id,
+            run_id=self.run_id,
+            transaction_id=self.state["transaction_id"],
+            **fields,
+        )
+
+    @staticmethod
+    def _parse_heartbeat(raw_line: str) -> dict[str, Any] | None:
+        if not _LEGACY_HEARTBEAT.fullmatch(raw_line):
+            return None
+        fields: dict[str, str] = {}
+        for token in raw_line.rstrip("\r\n").split()[1:]:
+            key, value = token.split("=", 1)
+            if key in fields:
+                return None
+            fields[key] = value
+        try:
+            hz = int(fields["ping_hz"])
+            boot_epoch = int(fields["boot_epoch"])
+        except (KeyError, ValueError):
+            return None
+        if not 0 <= hz <= 50 or boot_epoch < 0:
+            return None
+        return {"ping_hz": hz, "boot_epoch": boot_epoch, "fields": fields}
+
+    def observe_line(self, raw_line: str) -> None:
+        heartbeat = self._parse_heartbeat(raw_line)
+        if heartbeat is None:
+            return
+        heartbeat["observed_monotonic_ns"] = self.monotonic_ns()
+        heartbeat["observed_wall_time_ns"] = self.now_ns()
+        self.last_heartbeat = heartbeat
+        if self.state is None:
+            return
+        phase = self.state["phase"]
+        if phase not in {"await-postcondition", "await-restore-postcondition"}:
+            return
+        if heartbeat["observed_monotonic_ns"] <= self.state.get("ack_monotonic_ns", 0):
+            return
+        expected_hz = self.state["hz"] if phase == "await-postcondition" else self.state["prior_heartbeat"]["ping_hz"]
+        same_boot = heartbeat["boot_epoch"] == self.state["prior_heartbeat"]["boot_epoch"]
+        if same_boot and heartbeat["ping_hz"] == expected_hz:
+            postcondition = {
+                "verified": True,
+                "heartbeat": heartbeat,
+                "same_boot": True,
+            }
+            if phase == "await-postcondition":
+                self.state["postcondition"] = postcondition
+                self._event("verified", phase=phase, postcondition=postcondition)
+                self._finish("committed", "postcondition-verified")
+            else:
+                self.state["rollback"] = {"attempted": True, "verified": True, "postcondition": postcondition}
+                self._event("restored", phase=phase, postcondition=postcondition)
+                self._finish("rolled-back", "restore-postcondition-verified")
+            return
+        mismatch = {"verified": False, "heartbeat": heartbeat, "same_boot": same_boot}
+        if phase == "await-postcondition":
+            self.state["postcondition"] = mismatch
+            self._event("postcondition-mismatch", postcondition=mismatch)
+            self._begin_restore("postcondition-mismatch")
+        else:
+            self.state["rollback"] = {"attempted": True, "verified": False, "postcondition": mismatch}
+            self._event("restore-postcondition-mismatch", postcondition=mismatch)
+            self._finish("rollback-failed", "restore-postcondition-mismatch")
+
+    def _adopt_queued(self) -> bool:
+        if self.state is not None or not self.command_path.exists():
+            return False
+        command = json.loads(self.command_path.read_text(encoding="utf-8"))
+        if command.get("kind") != "legacy-set-rate":
+            return False
+        if (
+            command.get("schema_version") != TRANSACTION_SCHEMA_LEGACY_RATE_V1
+            or command.get("protocol") != "cws-legacy-ping-rate/1"
+            or command.get("source_id") != self.source_id
+            or command.get("run_id") != self.run_id
+            or command.get("command_id") != command.get("transaction_id")
+            or not isinstance(command.get("transaction_id"), str)
+            or not _ID.fullmatch(command["transaction_id"])
+            or isinstance(command.get("hz"), bool)
+            or not isinstance(command.get("hz"), int)
+            or not 0 <= command["hz"] <= 50
+        ):
+            raise ValueError("invalid-queued-legacy-rate-transaction")
+        transaction = transaction_ledger_summary(self.ledger.path)["transactions"].get(command["transaction_id"])
+        if transaction is None:
+            self.ledger.append(
+                "queued-recovered",
+                schema_version=TRANSACTION_SCHEMA_LEGACY_RATE_V1,
+                transaction_id=command["transaction_id"],
+                command_id=command["command_id"],
+                source_id=self.source_id,
+                run_id=self.run_id,
+                requested_ping_hz=command["hz"],
+                wire_command=f"CWS_SET_PING_HZ {command['hz']}",
+            )
+        elif transaction.get("schema_version") != TRANSACTION_SCHEMA_LEGACY_RATE_V1:
+            raise ValueError("queued-legacy-rate-transaction-ledger-mismatch")
+        self.state = {
+            **command,
+            "phase": "queued",
+            "precondition_deadline_wall_time_ns": self.now_ns() + self.timeout_ns,
+            "prior_heartbeat": None,
+            "ack": None,
+            "apply_ack": None,
+            "restore_ack": None,
+            "rejection": None,
+            "postcondition": None,
+            "rollback": {"attempted": False},
+        }
+        self._save()
+        self.command_path.unlink(missing_ok=True)
+        self._event("adopted", precondition_deadline_wall_time_ns=self.state["precondition_deadline_wall_time_ns"])
+        return True
+
+    def poll(self, port: Any) -> bool:
+        self._adopt_queued()
+        if self.state is None:
+            return False
+        phase = self.state["phase"]
+        now_wall = self.now_ns()
+        if phase == "queued":
+            heartbeat = self.last_heartbeat
+            if (
+                heartbeat is None
+                or self.monotonic_ns() - heartbeat["observed_monotonic_ns"]
+                > LEGACY_HEARTBEAT_MAX_AGE_NS
+            ):
+                if now_wall >= self.state["precondition_deadline_wall_time_ns"]:
+                    self._finish("failed-safe", "fresh-heartbeat-precondition-timeout")
+                return True
+            self.state["prior_heartbeat"] = heartbeat
+            self._event("precondition-captured", prior_heartbeat=heartbeat)
+            self._send(port, restore=False)
+            return True
+        if phase == "restore-pending":
+            self._send(port, restore=True)
+            return True
+        if now_wall < self.state["deadline_wall_time_ns"]:
+            return True
+        if phase == "apply-await-ack":
+            self._event("timed-out", phase=phase)
+            self.state["postcondition"] = {"verified": False, "reason": "legacy-ack-timeout"}
+            self._begin_restore("legacy-ack-timeout")
+        elif phase == "await-postcondition":
+            self._event("timed-out", phase=phase)
+            self._begin_restore("postcondition-timeout")
+        elif phase == "restore-await-ack":
+            self._event("timed-out", phase=phase)
+            self.state["rollback"] = {"attempted": True, "verified": False, "reason": "restore-ack-timeout"}
+            self._finish("rollback-failed", "restore-ack-timeout")
+        else:
+            self._event("timed-out", phase=phase)
+            self.state["rollback"] = {"attempted": True, "verified": False, "reason": "restore-postcondition-timeout"}
+            self._finish("rollback-failed", "restore-postcondition-timeout")
+        return True
+
+    def _send(self, port: Any, *, restore: bool) -> None:
+        assert self.state is not None
+        hz = self.state["prior_heartbeat"]["ping_hz"] if restore else self.state["hz"]
+        payload = f"CWS_SET_PING_HZ {hz}\n".encode("ascii")
+        phase = "restore-await-ack" if restore else "apply-await-ack"
+        self.state["phase"] = phase
+        self.state["deadline_wall_time_ns"] = self.now_ns() + self.timeout_ns
+        self.state["sent_monotonic_ns"] = self.monotonic_ns()
+        self._save()
+        written = port.write(payload)
+        if written != len(payload):
+            raise OSError(f"short serial legacy control write: {written}/{len(payload)} bytes")
+        self._event(
+            "sent",
+            phase=phase,
+            wire_command=payload.decode("ascii").rstrip(),
+            deadline_wall_time_ns=self.state["deadline_wall_time_ns"],
+        )
+
+    def handle_line(self, raw_line: str) -> bool:
+        if self.state is None or not raw_line.startswith("CWS_CONFIG_"):
+            return False
+        applied = _LEGACY_APPLIED.fullmatch(raw_line)
+        rejected = _LEGACY_REJECTED.fullmatch(raw_line)
+        phase = self.state["phase"]
+        if phase not in {"apply-await-ack", "restore-await-ack"}:
+            self._event("late-or-malformed-legacy-reply", phase=phase, response=raw_line.rstrip("\r\n"))
+            return True
+        if rejected:
+            requested_hz = int(rejected.group(1))
+            if requested_hz > 4_294_967_295:
+                self._event("malformed", phase=phase, response=raw_line.rstrip("\r\n"))
+                return True
+            rejection = {
+                "response": raw_line.rstrip("\r\n"),
+                "requested_ping_hz": requested_hz,
+                "current_ping_hz": int(rejected.group(2)),
+                "error": rejected.group(3),
+            }
+            self.state["rejection"] = rejection
+            self._save()
+            self._event("rejected", phase=phase, rejection=rejection)
+            prior_hz = self.state["prior_heartbeat"]["ping_hz"]
+            if (
+                phase == "apply-await-ack"
+                and rejection["requested_ping_hz"] == self.state["hz"]
+                and rejection["current_ping_hz"] == prior_hz
+            ):
+                self._finish("failed-safe", "legacy-command-rejected")
+            else:
+                if phase == "apply-await-ack":
+                    self.state["postcondition"] = {
+                        "verified": False,
+                        "reason": "legacy-rejection-state-mismatch",
+                        "rejection": rejection,
+                    }
+                    self._begin_restore("legacy-rejection-state-mismatch")
+                else:
+                    self.state["rollback"] = {
+                        "attempted": True,
+                        "verified": False,
+                        "reason": "restore-command-rejected",
+                        "rejection": rejection,
+                    }
+                    self._finish("rollback-failed", "restore-command-rejected")
+            return True
+        if not applied:
+            self._event("malformed", phase=phase, response=raw_line.rstrip("\r\n"))
+            return True
+        acknowledged_hz = int(applied.group(1))
+        expected_hz = self.state["prior_heartbeat"]["ping_hz"] if phase == "restore-await-ack" else self.state["hz"]
+        ack = {"response": raw_line.rstrip("\r\n"), "ping_hz": acknowledged_hz, "expected_ping_hz": expected_hz}
+        if phase == "apply-await-ack":
+            self.state["apply_ack"] = ack
+        else:
+            self.state["restore_ack"] = ack
+        self.state["ack"] = ack
+        self._save()
+        self._event("acknowledged", phase=phase, ack=ack)
+        if acknowledged_hz != expected_hz:
+            if phase == "apply-await-ack":
+                self.state["postcondition"] = {"verified": False, "reason": "ack-rate-mismatch", "ack": ack}
+                self._begin_restore("ack-rate-mismatch")
+            else:
+                self.state["rollback"] = {
+                    "attempted": True,
+                    "verified": False,
+                    "reason": "restore-ack-rate-mismatch",
+                    "ack": ack,
+                }
+                self._finish("rollback-failed", "restore-ack-rate-mismatch")
+            return True
+        self.state["ack"] = ack
+        self.state["ack_monotonic_ns"] = self.monotonic_ns()
+        self.state["deadline_wall_time_ns"] = self.now_ns() + self.timeout_ns
+        self.state["phase"] = "await-restore-postcondition" if phase == "restore-await-ack" else "await-postcondition"
+        self._save()
+        return True
+
+    def _begin_restore(self, reason: str) -> None:
+        assert self.state is not None
+        if self.state.get("prior_heartbeat") is None:
+            self._finish("rollback-failed", "missing-prior-heartbeat")
+            return
+        if self.state.get("rollback", {}).get("attempted"):
+            self._finish("rollback-failed", "restore-attempt-limit")
+            return
+        self.state["rollback"] = {"attempted": True, "verified": False, "reason": reason}
+        self._event("restore-requested", reason=reason, prior_heartbeat=self.state["prior_heartbeat"])
+        # The next worker poll owns the serial write; this avoids any direct
+        # I/O from a line-handling path.
+        self.state["phase"] = "restore-pending"
+        self._save()
+
+    def _finish(self, terminal: str, reason: str) -> None:
+        assert self.state is not None
+        facts = {
+            "requested_ping_hz": self.state["hz"],
+            "prior_heartbeat": self.state.get("prior_heartbeat"),
+            "ack": self.state.get("ack"),
+            "apply_ack": self.state.get("apply_ack"),
+            "restore_ack": self.state.get("restore_ack"),
+            "rejection": self.state.get("rejection"),
+            "postcondition": self.state.get("postcondition"),
+            "rollback": self.state.get("rollback"),
+        }
+        facts_sha256 = canonical_sha256(facts)
+        self.state["terminal_intent"] = {
+            "terminal": terminal,
+            "reason": reason,
+            "terminal_facts": facts,
+            "terminal_facts_sha256": facts_sha256,
+        }
+        self._save()
+        self._seal_terminal(terminal, reason, facts, facts_sha256)
+
+    def _seal_terminal(
+        self, terminal: str, reason: str, facts: dict[str, Any], facts_sha256: str
+    ) -> None:
+        assert self.state is not None and terminal in _TERMINAL
+        assert facts_sha256 == canonical_sha256(facts)
+        self._event(terminal, reason=reason, terminal_facts=facts, terminal_facts_sha256=facts_sha256)
+        _atomic_json(self.status_path, {
+            "schema_version": TRANSACTION_SCHEMA_LEGACY_RATE_V1,
+            "command_id": self.state["command_id"], "transaction_id": self.state["transaction_id"],
+            "source_id": self.source_id, "run_id": self.run_id, "hz": self.state["hz"],
+            "status": "applied" if terminal == "committed" else "rejected",
+            "transaction_status": terminal, "reason": reason,
+            "responded_wall_time_ns": self.now_ns(), "terminal_facts": facts,
+            "terminal_facts_sha256": facts_sha256,
+        })
+        self.pending_path.unlink(missing_ok=True)
+        self.state = None
+
+    def shutdown(self) -> None:
+        self._adopt_queued()
+        if self.state is None:
+            return
+        if self.state["phase"] == "queued":
+            self._finish("failed-safe", "collector-stopped-before-legacy-mutation")
+        else:
+            self._finish("rollback-failed", "collector-stopped-with-unverified-legacy-state")
+
+
 class FirmwareControlBridge:
     """Persistent, bounded PREPARE/APPLY/VERIFY/RESTORE state machine."""
 
@@ -374,10 +967,12 @@ class FirmwareControlBridge:
         if not self.pending_path.exists():
             return None
         state = json.loads(self.pending_path.read_text(encoding="utf-8"))
+        if state.get("kind") == "legacy-set-rate":
+            return None
         schema_version = state.get("schema_version")
         decision_sha256 = state.get("decision_sha256")
         if (
-            schema_version not in TRANSACTION_SCHEMAS
+            schema_version not in VERSIONED_TRANSACTION_SCHEMAS
             or state.get("source_id") != self.source_id
             or state.get("run_id") != self.run_id
             or state.get("protocol") != FIRMWARE_CONTROL_V1
@@ -513,7 +1108,7 @@ class FirmwareControlBridge:
         schema_version = command.get("schema_version")
         decision_sha256 = command.get("decision_sha256")
         if (
-            schema_version not in TRANSACTION_SCHEMAS
+            schema_version not in VERSIONED_TRANSACTION_SCHEMAS
             or command.get("protocol") != FIRMWARE_CONTROL_V1
             or command.get("source_id") != self.source_id
             or command.get("run_id") != self.run_id

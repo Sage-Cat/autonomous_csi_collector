@@ -21,6 +21,8 @@ from cws_collector import __version__
 from cws_collector.protocols import read_source_record, source_record_v2
 from cws_collector.transactions import (
     FirmwareControlBridge,
+    LegacyRateControlBridge,
+    queue_legacy_rate_transaction,
     queue_rate_transaction,
     transaction_ledger_summary,
 )
@@ -238,7 +240,9 @@ def preflight(config: dict[str, Any], duration_seconds: int, state_dir: Path) ->
     for source in enabled_sources(config):
         source_id = source["source_id"]
         device = Path(source["device"])
+        queued_control_path = state_dir / "control" / f"{source_id}.json"
         pending_control_path = state_dir / "control-pending" / f"{source_id}.json"
+        queued_control_exists = queued_control_path.exists()
         pending_control_exists = pending_control_path.exists()
         exists = device.exists()
         accessible = os.access(device, os.R_OK | os.W_OK) if exists else False
@@ -251,6 +255,11 @@ def preflight(config: dict[str, Any], duration_seconds: int, state_dir: Path) ->
                 f"{source_id}: unresolved control transaction exists at {pending_control_path}; "
                 "resolve it before arming a new run"
             )
+        if queued_control_exists:
+            problems.append(
+                f"{source_id}: unresolved queued control command exists at {queued_control_path}; "
+                "resolve it before arming a new run"
+            )
         source_results.append(
             {
                 "source_id": source_id,
@@ -258,6 +267,8 @@ def preflight(config: dict[str, Any], duration_seconds: int, state_dir: Path) ->
                 "resolved_device": str(device.resolve(strict=False)),
                 "exists": exists,
                 "accessible": accessible,
+                "queued_control_command_path": str(queued_control_path),
+                "queued_control_command_exists": queued_control_exists,
                 "pending_control_transaction_path": str(pending_control_path),
                 "pending_control_transaction_exists": pending_control_exists,
             }
@@ -585,6 +596,13 @@ class SerialWorker(threading.Thread):
             run_id=run_dir.name,
             timeout_seconds=self.command_ack_timeout_seconds,
         )
+        self.legacy_rate_bridge = LegacyRateControlBridge(
+            state_dir=state_dir,
+            run_dir=run_dir,
+            source_id=source["source_id"],
+            run_id=run_dir.name,
+            timeout_seconds=self.command_ack_timeout_seconds,
+        )
 
     def _set_current_port(self, port: Any) -> None:
         with self._port_lock:
@@ -628,6 +646,8 @@ class SerialWorker(threading.Thread):
 
     def _send_pending_command(self, port: Any) -> None:
         if self.control_bridge.poll(port):
+            return
+        if self.legacy_rate_bridge.poll(port):
             return
         if self.pending_command is not None:
             assert self.pending_command_sent_monotonic is not None
@@ -690,7 +710,10 @@ class SerialWorker(threading.Thread):
             )
 
     def _handle_command_response(self, raw_line: str) -> None:
+        self.legacy_rate_bridge.observe_line(raw_line)
         if self.control_bridge.handle_line(raw_line):
+            return
+        if self.legacy_rate_bridge.handle_line(raw_line):
             return
         if self.pending_command is None:
             return
@@ -788,6 +811,7 @@ class SerialWorker(threading.Thread):
         finally:
             try:
                 self.control_bridge.shutdown()
+                self.legacy_rate_bridge.shutdown()
             finally:
                 self.writer.close("complete")
             with self.stats.lock:
@@ -1387,6 +1411,26 @@ def request_rate(
             transaction_id=transaction_id,
             decision_sha256=decision_sha256,
         )
+    except (RuntimeError, ValueError) as exc:
+        raise CollectorError(str(exc)) from exc
+
+
+def request_legacy_rate(state_dir: Path, source_id: str, hz: int) -> dict[str, Any]:
+    """Queue the explicit legacy-only CWS_SET_PING_HZ compatibility path."""
+
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}", source_id):
+        raise CollectorError(f"invalid source_id: {source_id!r}")
+    if isinstance(hz, bool) or not isinstance(hz, int) or not 0 <= hz <= 50:
+        raise CollectorError("rate must be from 0 to 50 Hz")
+    active_path = state_dir / "active.json"
+    if not active_path.exists():
+        raise CollectorError("no run is active")
+    active = json.loads(active_path.read_text(encoding="utf-8"))
+    configured_sources = {source["source_id"] for source in enabled_sources(active["config"])}
+    if source_id not in configured_sources:
+        raise CollectorError(f"source is not active in this run: {source_id}")
+    try:
+        return queue_legacy_rate_transaction(state_dir, active, source_id, hz)
     except (RuntimeError, ValueError) as exc:
         raise CollectorError(str(exc)) from exc
 

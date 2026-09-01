@@ -162,12 +162,38 @@ class PreflightGuardTests(unittest.TestCase):
             self.assertFalse((state_dir / "active.json").exists())
             self.assertFalse((state_dir / "runs").exists())
 
+    def test_queued_control_command_blocks_preflight_and_arm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            config_path = state_dir / "config.json"
+            config_path.write_text(json.dumps(self.config()), encoding="utf-8")
+            queued_path = state_dir / "control/esp32-test.json"
+            queued_path.parent.mkdir()
+            queued_bytes = b'{"kind":"legacy-set-rate","hz":20}\n'
+            queued_path.write_bytes(queued_bytes)
+
+            result = self.run_preflight(state_dir)
+
+            self.assertFalse(result["ok"])
+            self.assertIn("unresolved queued control command exists", result["problems"][0])
+            self.assertTrue(result["sources"][0]["queued_control_command_exists"])
+            disk_usage = types.SimpleNamespace(free=16 * 1024**3)
+            with (
+                patch.dict(sys.modules, {"serial": types.ModuleType("serial")}),
+                patch.object(core_module.shutil, "disk_usage", return_value=disk_usage),
+                self.assertRaisesRegex(CollectorError, "unresolved queued control command exists"),
+            ):
+                arm_run(config_path, state_dir, 60, "must-not-arm-queued")
+            self.assertEqual(queued_path.read_bytes(), queued_bytes)
+            self.assertFalse((state_dir / "active.json").exists())
+
     def test_ordinary_preflight_passes_without_pending_transaction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result = self.run_preflight(Path(temporary))
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["problems"], [])
+            self.assertFalse(result["sources"][0]["queued_control_command_exists"])
             self.assertFalse(result["sources"][0]["pending_control_transaction_exists"])
 
 
