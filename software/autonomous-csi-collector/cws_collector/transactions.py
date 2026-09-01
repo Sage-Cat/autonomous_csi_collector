@@ -150,6 +150,13 @@ class TransactionLedger:
             raise ValueError("unsupported-command-transaction-schema")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a+", encoding="utf-8") as stream:
+            # The operator CLI can create the run-wide ledger while the
+            # collector service appends later through the shared deployment
+            # group.  Only the owner may chmod the inode, so normalize a new
+            # or noncanonical file before use and leave an already-correct
+            # shared file untouched.
+            if (os.fstat(stream.fileno()).st_mode & 0o777) != 0o660:
+                os.fchmod(stream.fileno(), 0o660)
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             stream.seek(0)
             sequence, previous, transaction_schemas, transaction_decisions = self._validated_state(stream.read())
@@ -184,7 +191,6 @@ class TransactionLedger:
             stream.flush()
             os.fsync(stream.fileno())
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-        os.chmod(self.path, 0o660)
         return event
 
     def classify_reply(

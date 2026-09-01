@@ -56,6 +56,23 @@ class FakePort:
         raise AssertionError("serial flush/tcdrain must not be used")
 
 
+class TransactionLedgerPermissionTests(unittest.TestCase):
+    def test_new_ledger_is_group_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "command-transactions.ndjson"
+            TransactionLedger(path).append("test-event")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o660)
+
+    def test_existing_canonical_shared_ledger_is_not_rechmodded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "command-transactions.ndjson"
+            path.touch(mode=0o660)
+            path.chmod(0o660)
+            with patch("cws_collector.transactions.os.fchmod") as fchmod:
+                TransactionLedger(path).append("test-event")
+            fchmod.assert_not_called()
+
+
 def request_fields(line: str) -> dict[str, str]:
     return dict(token.split("=", 1) for token in line.strip().split()[1:])
 

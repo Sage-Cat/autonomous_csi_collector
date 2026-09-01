@@ -64,6 +64,9 @@ IDs and deadlines; correlated reply hashes; and postcondition/rollback facts
 in its hash chain. Replaceable control-status JSON is only a compatibility
 view, never the authority; it carries the same frozen terminal facts and their
 canonical hash so a consumer can validate the view against the event stream.
+The append-only ledger is group-writable and supports operator-created queues
+followed by service-owned appends without requiring either process to change
+ownership or permissions on the other's already-canonical file.
 An early terminal retains an explicit reason and real `null` values for
 unavailable pre-change, applied, or restored hashes instead of inventing
 sentinel evidence. The collector persists an in-flight transaction,
