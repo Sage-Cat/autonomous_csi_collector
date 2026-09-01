@@ -762,12 +762,22 @@ class SerialWorker(threading.Thread):
                 try:
                     with self.stats.lock:
                         self.stats.status = "connecting"
+                    # Native USB Serial/JTAG devices can interpret pyserial's
+                    # asserted default DTR/RTS state as a reset/download-mode
+                    # request.  Configure both lines while the port is still
+                    # closed, then open it exclusively so acquisition cannot
+                    # silently hold a sensor in its bootloader.
                     port = serial.Serial(
-                        port=device,
+                        port=None,
                         baudrate=baud,
                         timeout=1.0,
                         write_timeout=1.0,
+                        exclusive=True,
                     )
+                    port.dtr = False
+                    port.rts = False
+                    port.port = device
+                    port.open()
                     connection_epoch += 1
                     self._set_current_port(port)
                     try:
@@ -782,6 +792,9 @@ class SerialWorker(threading.Thread):
                                 resolved_device=str(Path(device).resolve(strict=False)),
                                 baud=baud,
                                 connection_epoch=connection_epoch,
+                                dtr_requested_asserted=False,
+                                rts_requested_asserted=False,
+                                exclusive_access_requested=True,
                             )
                             while not self.stop_event.is_set():
                                 self._send_pending_command(port)

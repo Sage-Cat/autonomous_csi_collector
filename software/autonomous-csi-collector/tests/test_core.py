@@ -302,6 +302,14 @@ class BlockingSerialPort:
         self.write_released = threading.Event()
         self.closed = False
         self.flush_called = False
+        self.open_called = False
+        self.dtr: bool | None = None
+        self.rts: bool | None = None
+        self.port: str | None = None
+
+    def open(self) -> None:
+        self.open_called = True
+        self.closed = False
 
     def __enter__(self) -> BlockingSerialPort:
         return self
@@ -424,8 +432,14 @@ class SerialShutdownTests(unittest.TestCase):
 
             self.assertFalse(worker.is_alive())
             self.assertTrue(port.closed)
+            self.assertTrue(port.open_called)
+            self.assertIsNone(serial_call["port"])
             self.assertEqual(serial_call["timeout"], 1.0)
             self.assertEqual(serial_call["write_timeout"], 1.0)
+            self.assertIs(serial_call["exclusive"], True)
+            self.assertIs(port.dtr, False)
+            self.assertIs(port.rts, False)
+            self.assertEqual(port.port, "/dev/fake")
             self.assertEqual(stats.snapshot(time.monotonic_ns())["errors"], 0)
             events = (Path(temporary) / "runs/run-test/events.ndjson").read_text(encoding="utf-8")
             self.assertNotIn('"event_type":"source_disconnected"', events)

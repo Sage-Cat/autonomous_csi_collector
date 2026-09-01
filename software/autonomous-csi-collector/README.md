@@ -19,6 +19,12 @@ never embeds those deployment values in this tree.
 
 Prefer stable `/dev/serial/by-id/` paths, or a fixed `/dev/serial/by-path/` path when a board has no unique serial identity. Do not bridge management and experimental interfaces or enable forwarding. Optional samplers run only their configured argument vectors, without a shell, and should remain disabled until validated for the local deployment.
 
+The serial worker opens each source exclusively with DTR and RTS explicitly
+deasserted before the device is opened. This prevents the common pyserial
+defaults from holding native USB Serial/JTAG sensors in reset or download mode;
+the requested line states and exclusive-open intent are recorded in the
+`source_connected` event.
+
 ## Operation
 
 ```sh
