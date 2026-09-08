@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import fcntl
 import gzip
 import io
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -71,6 +73,53 @@ class TransactionLedgerPermissionTests(unittest.TestCase):
             with patch("cws_collector.transactions.os.fchmod") as fchmod:
                 TransactionLedger(path).append("test-event")
             fchmod.assert_not_called()
+
+    def test_summary_waits_for_in_progress_locked_append(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "command-transactions.ndjson"
+            TransactionLedger(path).append("test-event")
+            writer_holds_lock = threading.Event()
+            release_writer = threading.Event()
+            reader_finished = threading.Event()
+            reader_result: dict[str, object] = {}
+
+            def partial_writer() -> None:
+                with path.open("a+", encoding="utf-8") as stream:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                    stream.seek(0, os.SEEK_END)
+                    original_size = stream.tell()
+                    stream.write('{"incomplete":')
+                    stream.flush()
+                    writer_holds_lock.set()
+                    release_writer.wait(timeout=2)
+                    stream.seek(original_size)
+                    stream.truncate()
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+            def reader() -> None:
+                try:
+                    reader_result["summary"] = transaction_ledger_summary(path)
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    reader_result["error"] = exc
+                finally:
+                    reader_finished.set()
+
+            writer_thread = threading.Thread(target=partial_writer)
+            reader_thread = threading.Thread(target=reader)
+            writer_thread.start()
+            self.assertTrue(writer_holds_lock.wait(timeout=1))
+            reader_thread.start()
+            self.assertFalse(reader_finished.wait(timeout=0.1))
+            release_writer.set()
+            writer_thread.join(timeout=2)
+            reader_thread.join(timeout=2)
+
+            self.assertFalse(writer_thread.is_alive())
+            self.assertFalse(reader_thread.is_alive())
+            self.assertNotIn("error", reader_result)
+            self.assertEqual(reader_result["summary"]["events"], 1)  # type: ignore[index]
 
 
 def request_fields(line: str) -> dict[str, str]:

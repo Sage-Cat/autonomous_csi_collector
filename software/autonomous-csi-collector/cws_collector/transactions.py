@@ -240,7 +240,17 @@ class TransactionLedger:
 def transaction_ledger_summary(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {"events": 0, "file_sha256": None, "chain_head_sha256": None, "transactions": {}}
-    raw = path.read_bytes()
+    # Ledger writers serialize append + fsync under an exclusive advisory
+    # lock.  Readers must participate in the same protocol: an unlocked
+    # read can otherwise observe the final JSON line between write() and
+    # flush()/fsync(), which is neither a valid snapshot nor evidence of a
+    # corrupt ledger.
+    with path.open("rb") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+        try:
+            raw = stream.read()
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
     _, _, transaction_schemas, transaction_decisions = TransactionLedger._validated_state(
         raw.decode("utf-8")
     )
