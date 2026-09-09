@@ -48,6 +48,9 @@ id_*
 images/
 tools/*.AppImage
 
+# Local task worktrees.
+/wt/
+
 # Private owner data and generated workspace views are never public-release inputs.
 /materials/
 /provenance/
